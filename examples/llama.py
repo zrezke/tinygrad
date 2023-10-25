@@ -297,28 +297,56 @@ class AbsmaxQuantizedLinear:
         new_tensors[name] = v
     return new_tensors
 
+from examples.gguf import load_gguf
 class LLaMa:
   @staticmethod
   def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=False):
     from sentencepiece import SentencePieceProcessor
-    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path))
+    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path).replace("LLaMA/", ""))
     assert sp_model.vocab_size() == MODEL_PARAMS[model_gen][model_size]["args"]["vocab_size"]
+    # params = MODEL_PARAMS[model_gen][model_size]
+    # model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear) if quantize else Transformer(**params["args"])
 
-    params = MODEL_PARAMS[model_gen][model_size]
-    model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear) if quantize else Transformer(**params["args"])
+    # # if model_path.is_dir():
+    # #   weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
+    # # else:
+    # #   weights = load(str(model_path))
+    # # if "model.embed_tokens.weight" in weights:
+    #   # weights = convert_from_huggingface(weights, model)
+    # if quantize:
+    #   weights = AbsmaxQuantizedLinear.quantize(weights)
+    #   for _,v in weights.items(): v.realize()
+    # load_state_dict(model, weights, strict=False)
 
-    if model_path.is_dir():
-      weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
-    else:
-      weights = load(str(model_path))
-    if "model.embed_tokens.weight" in weights:
-      weights = convert_from_huggingface(weights, model)
+    # ::: GGUF :::
+    gguf = load_gguf(model_path)
+    args = {"dim": 4096, "n_layers": 32, "n_heads": 32, "multiple_of": 256, "ffn_dim_multiplier": 1.0, "norm_eps": 1e-5, "rope_theta": 1000000, "vocab_size": 32000}
+    model = Transformer(**args)
+    keymap = {
+      "token_embd.weight": "tok_embeddings.weight",
+      **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
+      **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
+      **{f"blk.{l}.ffn_{x}.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(len(model.layers))},
+      **{f"blk.{l}.attn_{x}.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "output"] for l in range(len(model.layers))},
+      "output_norm.weight": "norm.weight",
+      "output.weight": "output.weight",
+    }
 
-    if quantize:
-      weights = AbsmaxQuantizedLinear.quantize(weights)
-      for _,v in weights.items(): v.realize()
+    weights = {}
+    for k in gguf["tensor_infos"]:
+      if ".rotary_emb." not in k:
+        tensor_info = gguf["tensor_infos"][k]
+        print(k, tensor_info)
+        size = np.prod(tensor_info["dimensions"])
+        b = np.frombuffer(gguf["tensor_data"][tensor_info["offset"]: tensor_info["offset"] + size * np.dtype(tensor_info["type"]).itemsize], dtype=tensor_info["type"])
+        try:
+          weights[keymap[k]] = b.reshape(tensor_info["dimensions"][::-1])
+        except:
+          print("ERROR", k, tensor_info)
+          weights[keymap[k]] = np.ones(tensor_info["dimensions"][::-1], dtype=tensor_info["type"])
+        weights[keymap[k]] = Tensor(weights[keymap[k]])
+    del gguf["tensor_data"]
     load_state_dict(model, weights, strict=False)
-
     return LLaMa(model, sp_model)
 
   def __init__(self, model, tokenizer):
